@@ -1,0 +1,34 @@
+# Built files
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Android Studio
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Output
+/app/build
+/app/release
+
+# Keystore (敏感文件)
+*.jks
+*.keystore
+
+# IDE
+.idea/
+*.swp
+*~.nib
+
+# OS
+.DS_Store
+Thumbs.db
