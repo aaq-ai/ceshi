@@ -151,7 +151,10 @@ class MainActivity : AppCompatActivity() {
                 ): Boolean {
                     fileChooserCallback?.onReceiveValue(null)
                     fileChooserCallback = filePathCallback
-                    val intent = fileChooserParams?.createIntent()
+                    val intent = fileChooserParams?.createIntent() ?: run {
+                        fileChooserCallback = null
+                        return false
+                    }
                     try {
                         startActivityForResult(intent, FILE_CHOOSER_REQUEST)
                     } catch (e: Exception) {
