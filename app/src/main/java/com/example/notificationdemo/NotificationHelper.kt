@@ -51,14 +51,18 @@ class NotificationHelper(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "notification_popup_channel"
-        const val CHANNEL_NAME = "重要通知弹窗"
+        const val CHANNEL_NAME = "yann 消息通知"
         const val CHANNEL_DESC = "高优先级通知，将以弹窗形式展示"
         const val NOTIFICATION_ID = 1001
         private const val REQUEST_CODE = 1001
+        private const val WEB_NOTIFICATION_ID_BASE = 2000
     }
 
     private val notificationManager =
         context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    /** 网页消息通知自增 id，保证多条消息各自独立、不互相覆盖 */
+    private var webNotifyId = WEB_NOTIFICATION_ID_BASE
 
     // ──────────────────────────────────────────
     // 1. 创建通知渠道 (Android 8.0+ 必需)
@@ -111,6 +115,37 @@ class NotificationHelper(private val context: Context) {
             .build()
 
         notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    // ──────────────────────────────────────────
+    // 2b. 发送网页消息通知（每条独立 id，可堆叠）
+    // ──────────────────────────────────────────
+    fun sendWebNotification(title: String, content: String, targetActivity: Class<*>) {
+        val intent = Intent(context, targetActivity).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            webNotifyId,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .build()
+
+        notificationManager.notify(webNotifyId, notification)
+        if (webNotifyId < Int.MAX_VALUE - 1) webNotifyId++
     }
 
     // ──────────────────────────────────────────

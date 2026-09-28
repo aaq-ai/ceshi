@@ -21,17 +21,4 @@
         android:progressTint="#4CAF50"
         android:visibility="gone" />
 
-    <!-- 测试通知按钮 (可删除) -->
-    <Button
-        android:id="@+id/btnTestNotification"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_alignParentBottom="true"
-        android:layout_alignParentEnd="true"
-        android:layout_margin="16dp"
-        android:text="测试通知"
-        android:textSize="12sp"
-        android:alpha="0.7"
-        android:backgroundTint="#4CAF50" />
-
 </RelativeLayout>

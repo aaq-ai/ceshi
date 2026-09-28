@@ -11,20 +11,29 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.*
-import android.widget.Button
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private lateinit var notificationHelper: NotificationHelper
 
+    /** 网页通知桥接脚本内容，null 表示加载失败 */
+    private var bridgeScript: String? = null
+
+    /** true = 已通过 document-start 注入，无需 onPageFinished 再注 */
+    private var bridgeInjectedEarly = false
+
     companion object {
         const val TARGET_URL = "https://app-c0d3yeieus5d.appmiaoda.com/"
+        private const val BRIDGE_ASSET = "notify_bridge.js"
+        private const val BRIDGE_ORIGIN_RULE = "https://app-c0d3yeieus5d.appmiaoda.com"
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val LOCATION_PERMISSION_CODE = 1002
         private const val CAMERA_PERMISSION_CODE = 1003
@@ -49,19 +58,10 @@ class MainActivity : AppCompatActivity() {
         // 初始化 WebView
         webView = findViewById(R.id.webView)
         setupWebView()
+        installNotificationBridge()
 
         // 检查并申请通知权限
         checkNotificationPermission()
-
-        // 发送一条测试通知（可移除）
-        findViewById<Button>(R.id.btnTestNotification)?.setOnClickListener {
-            notificationHelper.sendNotification(
-                title = "通知测试",
-                content = "通知弹窗功能已就绪！点击可返回应用。",
-                targetActivity = MainActivity::class.java
-            )
-            Toast.makeText(this, "通知已发送", Toast.LENGTH_SHORT).show()
-        }
 
         // 加载目标网页
         if (savedInstanceState != null) {
@@ -123,6 +123,14 @@ class MainActivity : AppCompatActivity() {
                         return true
                     }
                     return false
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    // 兜底注入：不支持 document-start 的旧 WebView 内核走这里
+                    if (!bridgeInjectedEarly) {
+                        bridgeScript?.let { view?.evaluateJavascript(it, null) }
+                    }
                 }
 
                 override fun onReceivedSslError(
@@ -225,6 +233,63 @@ class MainActivity : AppCompatActivity() {
             // 启用调试（发布时移除）
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 WebView.setWebContentsDebuggingEnabled(true)
+            }
+        }
+    }
+
+    // ==================== 网页通知桥接 ====================
+
+    /**
+     * 注入 notify_bridge.js 并挂上 AndroidNotify 接口。
+     *
+     * 为什么需要：Android WebView 未实现 Web Notifications API，
+     * window.Notification 为 undefined，网页只能退化成自绘的 DOM 横幅。
+     * 这里把 Notification 调用（以及 DOM 浮动横幅的文本）转成系统通知。
+     */
+    private fun installNotificationBridge() {
+        bridgeScript = loadBridgeScript()
+        if (bridgeScript == null) return
+
+        webView.addJavascriptInterface(NotifyBridge(), "AndroidNotify")
+
+        // 首选 document-start：在网页脚本执行前注入，
+        // 这样页面启动时做的 'Notification' in window 特性探测也能命中垫片
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try {
+                WebViewCompat.addDocumentStartJavaScript(
+                    webView, bridgeScript!!, setOf(BRIDGE_ORIGIN_RULE)
+                )
+                bridgeInjectedEarly = true
+            } catch (e: Exception) {
+                bridgeInjectedEarly = false
+            }
+        }
+    }
+
+    private fun loadBridgeScript(): String? = try {
+        assets.open(BRIDGE_ASSET).bufferedReader().use { it.readText() }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 网页侧调用入口，注意 @JavascriptInterface 必需 */
+    inner class NotifyBridge {
+        @JavascriptInterface
+        fun postMessage(payload: String) {
+            try {
+                val json = org.json.JSONObject(payload)
+                val title = json.optString("title").ifBlank { "yann" }
+                val body = json.optString("body")
+                if (body.isBlank() && title == "yann") return
+                runOnUiThread {
+                    notificationHelper.sendWebNotification(
+                        title = title,
+                        content = body,
+                        targetActivity = MainActivity::class.java
+                    )
+                }
+            } catch (e: Exception) {
+                // 载荷异常直接忽略，不影响网页
             }
         }
     }
