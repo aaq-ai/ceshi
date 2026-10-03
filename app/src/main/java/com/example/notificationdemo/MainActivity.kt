@@ -420,11 +420,20 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        // App 回到前台，不再需要保活服务
+        stopService(Intent(this, KeepAliveService::class.java))
     }
 
     override fun onPause() {
         super.onPause()
-        webView.onPause()
+        // 故意不调用 webView.onPause()：页面 JS 保持运行，消息才能继续到达
+        // 启动前台服务提高进程优先级，避免被系统杀掉
+        val intent = Intent(this, KeepAliveService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     override fun onDestroy() {

@@ -30,6 +30,7 @@
 
     <!-- 前台服务 (保活通知) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:allowBackup="true"
@@ -67,6 +68,12 @@
                 <data android:scheme="notificationdemo" />
             </intent-filter>
         </activity>
+
+        <!-- 后台保活服务：保持 WebView JS 运行，让网页消息持续触发系统通知 -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
     </application>
 
