@@ -359,10 +359,10 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun saveFile(name: String, mime: String, dataUrl: String) {
             Thread {
-                val saved = FileSaver.saveDownload(this, name, mime, dataUrl)
+                val saved = FileSaver.saveDownload(this@MainActivity, name, mime, dataUrl)
                 runOnUiThread {
                     if (saved != null) {
-                        Toast.makeText(this, "已导出到下载目录：$saved", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@MainActivity, "已导出到下载目录：$saved", Toast.LENGTH_LONG).show()
                         notificationHelper.sendWebNotification(
                             title = "导出完成",
                             content = saved,
@@ -370,7 +370,7 @@ class MainActivity : AppCompatActivity() {
                             targetActivity = MainActivity::class.java
                         )
                     } else {
-                        Toast.makeText(this, "导出失败，请重试", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "导出失败，请重试", Toast.LENGTH_SHORT).show()
                     }
                 }
             }.start()
