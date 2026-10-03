@@ -179,7 +179,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-                    try {
+                    return try {
                         fileChooserLauncher.launch(intent)
                         true
                     } catch (e: Exception) {
