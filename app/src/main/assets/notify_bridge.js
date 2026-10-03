@@ -85,7 +85,35 @@
   try { window.Notification = YannNotification; } catch (e) {}
 
   // 站点里形如 `'Notification' in window && Notification.permission === 'granted'`
-  // 的判断现在恒成立；ServiceWorker 分支在 WebView 中不存在，会自然走 new Notification()。
+  // 的判断现在恒成立。
+  // 用 defineProperty 强制覆盖：若 WebView 内核其实暴露了只读的 Notification，
+  // 普通赋值会静默失败，站点就会走到真实的 Notification 构造函数并抛 Illegal constructor
+  // → 被站点的 catch 吃掉 → 界面提示「通知发送失败」。
+  try {
+    Object.defineProperty(window, 'Notification', {
+      value: YannNotification, writable: true, configurable: true
+    });
+  } catch (e) {
+    try { window.Notification = YannNotification; } catch (e2) {}
+  }
+
+  /* ============ 1b. 中和 ServiceWorker 通知分支 ============
+   * 站点两条通知路径都优先尝试 ServiceWorker：
+   *   消息到达：'serviceWorker' in navigator && navigator.serviceWorker.ready
+   *               ? ready.then(r => r.showNotification(...)) : new Notification(...)
+   *   测试推送：'serviceWorker' in navigator && navigator.serviceWorker.controller
+   *               ? await(await ready).showNotification(...) : new Notification(...)
+   * WebView 不实现 ServiceWorker，ready 这条 Promise 永远 pending →
+   * 消息路径既不成功也不报错，通知静默丢失；测试推送路径 await 失败被 catch
+   * → 弹出「通知发送失败」。把这两个属性置空，强制两条路径都走 new Notification()。
+   */
+  try {
+    var sw = navigator.serviceWorker;
+    if (sw) {
+      try { Object.defineProperty(sw, 'ready', { value: undefined, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(sw, 'controller', { value: null, configurable: true }); } catch (e) {}
+    }
+  } catch (e) {}
 
   /* ============ 2. Blob 导出截获 ============ */
 
@@ -128,14 +156,35 @@
     }
   }
 
+  function anchorHref(a) {
+    try { return String(a.href || a.getAttribute('href') || ''); } catch (e) { return ''; }
+  }
+
+  function trySaveAnchor(a) {
+    var href = anchorHref(a);
+    if (href.indexOf('blob:') !== 0) return false;
+    var name = '';
+    try { name = a.download || a.getAttribute('download') || ''; } catch (e) {}
+    return saveBlobAs(href, name, '');
+  }
+
+  // 主拦截点：站点是 createElement('a') 后直接 click()，节点从未 append 进 DOM。
+  // 游离元素派发的事件不会冒泡/捕获到 document，所以 document 上的监听器根本收不到，
+  // 必须直接 patch 原型方法本身。
+  try {
+    var origAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+      try { if (trySaveAnchor(this)) return undefined; } catch (e) {}
+      return origAnchorClick.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  // 次级拦截：真实用户点击（元素已在 DOM 中）
   document.addEventListener('click', function (ev) {
     try {
       var a = ev.target && ev.target.closest ? ev.target.closest('a[download]') : null;
       if (!a) return;
-      var href = a.getAttribute('href') || a.href || '';
-      if (href.indexOf('blob:') !== 0) return;
-      var name = a.getAttribute('download') || '';
-      if (saveBlobAs(href, name, '')) {
+      if (trySaveAnchor(a)) {
         ev.preventDefault();
         ev.stopPropagation();
       }
