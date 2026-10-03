@@ -12,6 +12,7 @@ import android.view.View
 import android.view.WindowManager
 import android.webkit.*
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -30,17 +31,22 @@ class MainActivity : AppCompatActivity() {
     /** true = 已通过 document-start 注入，无需 onPageFinished 再注 */
     private var bridgeInjectedEarly = false
 
+    /** 等待系统权限授予后再放行的网页媒体请求 */
+    private var pendingMediaRequest: PermissionRequest? = null
+
+    /** 网页文件选择回调（实例字段：随 Activity 生命周期，不会指向已销毁的 WebView） */
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
     companion object {
         const val TARGET_URL = "https://app-c0d3yeieus5d.appmiaoda.com/"
         private const val BRIDGE_ASSET = "notify_bridge.js"
         private const val BRIDGE_ORIGIN_RULE = "https://app-c0d3yeieus5d.appmiaoda.com"
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val LOCATION_PERMISSION_CODE = 1002
-        private const val CAMERA_PERMISSION_CODE = 1003
-
-        // WebView 文件选择器回调
-        private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
-        private const val FILE_CHOOSER_REQUEST = 1004
+        private const val MEDIA_PERMISSION_CODE = 1003
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -157,19 +163,32 @@ class MainActivity : AppCompatActivity() {
                     filePathCallback: ValueCallback<Array<Uri>>?,
                     fileChooserParams: FileChooserParams?
                 ): Boolean {
+                    // 先释放上一次未完成的回调，避免网页卡住
                     fileChooserCallback?.onReceiveValue(null)
                     fileChooserCallback = filePathCallback
-                    val intent = fileChooserParams?.createIntent() ?: run {
-                        fileChooserCallback = null
-                        return false
-                    }
-                    try {
-                        startActivityForResult(intent, FILE_CHOOSER_REQUEST)
+
+                    val intent = try {
+                        fileChooserParams?.createIntent()
                     } catch (e: Exception) {
-                        fileChooserCallback = null
-                        return false
+                        null
+                    } ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = "image/*"
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        putExtra(Intent.EXTRA_LOCAL_ONLY, true)
                     }
-                    return true
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+                    try {
+                        fileChooserLauncher.launch(intent)
+                        true
+                    } catch (e: Exception) {
+                        // 无可用选择器：必须回调 null，否则文件选择器永久失效
+                        fileChooserCallback = null
+                        filePathCallback?.onReceiveValue(null)
+                        Toast.makeText(this@MainActivity, "没有找到可用的文件选择器", Toast.LENGTH_SHORT).show()
+                        false
+                    }
                 }
 
                 // 处理 JS alert
@@ -226,6 +245,43 @@ class MainActivity : AppCompatActivity() {
                             LOCATION_PERMISSION_CODE
                         )
                         callback?.invoke(origin, true, false)
+                    }
+                }
+
+                /**
+                 * getUserMedia 授权回调（麦克风/摄像头）。
+                 *
+                 * WebView 默认拒绝页面的媒体采集请求，且必须在这里显式 grant；
+                 * 只在系统设置里给 App 开麦克风权限是不够的。
+                 */
+                override fun onPermissionRequest(request: PermissionRequest?) {
+                    if (request == null) return
+                    runOnUiThread {
+                        val resources = request.resources
+                        val wantsAudio =
+                            resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+                        val wantsVideo =
+                            resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
+
+                        val missing = mutableListOf<String>()
+                        if (wantsAudio && !hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                            missing.add(Manifest.permission.RECORD_AUDIO)
+                        }
+                        if (wantsVideo && !hasPermission(Manifest.permission.CAMERA)) {
+                            missing.add(Manifest.permission.CAMERA)
+                        }
+
+                        if (missing.isEmpty()) {
+                            // 系统权限已具备，放行网页的采集请求
+                            request.grant(resources)
+                        } else {
+                            // 先申请系统运行时权限，授权成功后再放行
+                            pendingMediaRequest = request
+                            ActivityCompat.requestPermissions(
+                                this@MainActivity, missing.toTypedArray(),
+                                MEDIA_PERMISSION_CODE
+                            )
+                        }
                     }
                 }
             }
@@ -390,24 +446,96 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "定位权限被拒绝，部分网页功能可能受限", Toast.LENGTH_SHORT).show()
                 }
             }
-            CAMERA_PERMISSION_CODE -> {
-                if (grantResults.isNotEmpty() && grantResults[0] != PackageManager.PERMISSION_GRANTED) {
-                    Toast.makeText(this, "相机权限被拒绝", Toast.LENGTH_SHORT).show()
+            MEDIA_PERMISSION_CODE -> {
+                val granted = grantResults.isNotEmpty() &&
+                        grantResults[0] == PackageManager.PERMISSION_GRANTED
+                if (granted) {
+                    // 系统权限到手，放行网页等待中的 getUserMedia
+                    pendingMediaRequest?.let { req ->
+                        try {
+                            req.grant(req.resources)
+                        } catch (e: Exception) { /* 请求可能已失效 */ }
+                    }
+                } else {
+                    try {
+                        pendingMediaRequest?.deny()
+                    } catch (e: Exception) { /* ignore */ }
+                    Toast.makeText(this, "麦克风/相机权限被拒绝，语音功能不可用", Toast.LENGTH_LONG).show()
                 }
+                pendingMediaRequest = null
             }
         }
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == FILE_CHOOSER_REQUEST) {
-            fileChooserCallback?.onReceiveValue(
-                if (resultCode == RESULT_OK) WebChromeClient.FileChooserParams.parseResult(resultCode, data) else null
-            )
+    // ==================== 文件选择（表情/图片导入） ====================
+
+    /**
+     * 选择结果落地。
+     *
+     * 上一版导入失败的根因组合：
+     * 1. parseResult 对部分国产 ROM 相册返回的结果会解析出 null，回调拿到 null 就静默失败
+     * 2. 回调存在 companion object（静态）里，Activity 重建后指向已销毁的 WebView
+     * 3. 没有为返回的 content:// URI 申请读权限
+     */
+    private val fileChooserLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val callback = fileChooserCallback
             fileChooserCallback = null
-        } else {
-            super.onActivityResult(requestCode, resultCode, data)
+            if (callback == null) return@registerForActivityResult
+
+            val data = result.data
+            if (result.resultCode == RESULT_OK && data != null) {
+                grantReadPermission(data)
+            }
+
+            val uris = WebChromeClient.FileChooserParams
+                .parseResult(result.resultCode, data)
+                ?: extractUrisManually(result.resultCode, data)
+
+            callback.onReceiveValue(uris)
         }
+
+    /** 给返回的 URI 申请（可持久化的）读权限，保证 WebView 稍后仍能读取 */
+    private fun grantReadPermission(data: Intent) {
+        val candidates = mutableListOf<Uri>()
+        data.data?.let { candidates.add(it) }
+        data.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount) candidates.add(clip.getItemAt(i).uri)
+        }
+        candidates.forEach { uri ->
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // 非持久化授权来源，忽略；一次性授权仍随 Intent 传递
+            }
+        }
+    }
+
+    /** parseResult 解析不出来时的手工兜底：覆盖 data / clipData / extras 三种返回形态 */
+    private fun extractUrisManually(resultCode: Int, data: Intent?): Array<Uri>? {
+        if (resultCode != RESULT_OK || data == null) return null
+        val uris = LinkedHashSet<Uri>()
+        try {
+            data.data?.let { uris.add(it) }
+            data.clipData?.let { clip ->
+                for (i in 0 until clip.itemCount) {
+                    clip.getItemAt(i).uri?.let { uris.add(it) }
+                }
+            }
+            // 部分相册把结果放在 extras 里
+            val extras = data.extras ?: Bundle.EMPTY
+            for (key in extras.keySet()) {
+                when (val v = extras.get(key)) {
+                    is Uri -> uris.add(v)
+                    is ArrayList<*> -> v.forEach { if (it is Uri) uris.add(it) }
+                }
+            }
+        } catch (e: Exception) {
+            return null
+        }
+        return if (uris.isEmpty()) null else uris.toTypedArray()
     }
 
     // ==================== 生命周期 ====================
@@ -437,6 +565,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // 释放未完成的选择器回调与媒体授权请求，避免 WebView 状态卡死
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
+        try {
+            pendingMediaRequest?.deny()
+        } catch (e: Exception) { /* ignore */ }
+        pendingMediaRequest = null
         webView.destroy()
         super.onDestroy()
     }
