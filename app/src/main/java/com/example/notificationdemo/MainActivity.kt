@@ -7,11 +7,11 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.*
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -65,6 +65,7 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         setupWebView()
         installNotificationBridge()
+        setupBackHandling()
 
         // 检查并申请通知权限
         checkNotificationPermission()
@@ -336,17 +337,43 @@ class MainActivity : AppCompatActivity() {
                 val json = org.json.JSONObject(payload)
                 val title = json.optString("title").ifBlank { "yann" }
                 val body = json.optString("body")
+                val icon = json.optString("icon")
                 if (body.isBlank() && title == "yann") return
                 runOnUiThread {
                     notificationHelper.sendWebNotification(
                         title = title,
                         content = body,
+                        iconUrl = icon,
                         targetActivity = MainActivity::class.java
                     )
                 }
             } catch (e: Exception) {
                 // 载荷异常直接忽略，不影响网页
             }
+        }
+
+        /**
+         * 网页导出：JS 已把 Blob 读成 data URL，这里落到下载目录。
+         * WebView 原生 DownloadListener 处理不了 blob: 地址，所以必须走这条路。
+         */
+        @JavascriptInterface
+        fun saveFile(name: String, mime: String, dataUrl: String) {
+            Thread {
+                val saved = FileSaver.saveDownload(this, name, mime, dataUrl)
+                runOnUiThread {
+                    if (saved != null) {
+                        Toast.makeText(this, "已导出到下载目录：$saved", Toast.LENGTH_LONG).show()
+                        notificationHelper.sendWebNotification(
+                            title = "导出完成",
+                            content = saved,
+                            iconUrl = "",
+                            targetActivity = MainActivity::class.java
+                        )
+                    } else {
+                        Toast.makeText(this, "导出失败，请重试", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
         }
     }
 
@@ -576,13 +603,26 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // ==================== 返回键处理 ====================
+    // ==================== 返回键 ====================
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
-            webView.goBack()
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
+    /**
+     * 返回键 / 手势返回。
+     *
+     * 上一版只重写了 onKeyDown，而 Android 13+ 的手势返回走 OnBackInvokedCallback，
+     * 根本不经过 onKeyDown，于是直接 finish 退出 App。改用 Dispatcher 同时覆盖两种输入。
+     */
+    private fun setupBackHandling() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    webView.canGoBack() -> webView.goBack()
+                    else -> {
+                        // 网页没有可回退的历史（例如已在会话首屏）→ 交还系统处理
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            }
+        })
     }
 }

@@ -1,5 +1,6 @@
 package com.example.notificationdemo
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -117,21 +118,72 @@ class NotificationHelper(private val context: Context) {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
-    // ──────────────────────────────────────────
-    // 2b. 发送网页消息通知（每条独立 id，可堆叠）
-    // ──────────────────────────────────────────
-    fun sendWebNotification(title: String, content: String, targetActivity: Class<*>) {
+    // 最近发出的通知指纹，防止站点重复调用造成双弹
+    private val recentKeys = object : LinkedHashMap<String, Long>(24, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+            size > 24
+    }
+
+    /**
+     * 发送网页消息通知（每条独立 id，可堆叠）。
+     *
+     * 图标：站点在 new Notification 的 options 里传了对方头像，异步取到后补一次
+     * notify() 就地更新，取不到也不影响通知本身。
+     */
+    fun sendWebNotification(
+        title: String,
+        content: String,
+        iconUrl: String = "",
+        targetActivity: Class<*>
+    ) {
+        val key = title + "|" + content
+        val now = System.currentTimeMillis()
+        synchronized(recentKeys) {
+            val last = recentKeys[key]
+            if (last != null && now - last < 4000) return   // 4 秒内同内容不重复弹
+            recentKeys[key] = now
+        }
+
+        val id = webNotifyId
+        webNotifyId = if (webNotifyId >= WEB_NOTIFICATION_ID_BASE + 900) {
+            WEB_NOTIFICATION_ID_BASE
+        } else {
+            webNotifyId + 1
+        }
+
         val intent = Intent(context, targetActivity).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
-            webNotifyId,
+            id,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        notificationManager.notify(id, buildWebNotification(title, content, null, pendingIntent))
+
+        if (iconUrl.isNotBlank()) {
+            Thread {
+                val bmp = FileSaver.loadBitmap(iconUrl)
+                if (bmp != null) {
+                    try {
+                        notificationManager.notify(
+                            id, buildWebNotification(title, content, bmp, pendingIntent)
+                        )
+                    } catch (e: Exception) { /* 通知可能已被划掉 */ }
+                }
+            }.start()
+        }
+    }
+
+    private fun buildWebNotification(
+        title: String,
+        content: String,
+        largeIcon: android.graphics.Bitmap?,
+        pendingIntent: PendingIntent
+    ): Notification {
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(content)
@@ -142,10 +194,9 @@ class NotificationHelper(private val context: Context) {
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .build()
-
-        notificationManager.notify(webNotifyId, notification)
-        if (webNotifyId < Int.MAX_VALUE - 1) webNotifyId++
+            .setOnlyAlertOnce(true)      // 补头像的二次 notify 不重复响铃
+        if (largeIcon != null) builder.setLargeIcon(largeIcon)
+        return builder.build()
     }
 
     // ──────────────────────────────────────────

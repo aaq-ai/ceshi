@@ -1,14 +1,25 @@
 /*
- * yann 通知桥接脚本 v3
+ * yann 通知桥接脚本 v4
  *
- * 三层能力：
- *   L1 Web Notifications API 垫片  —— 网页调用 new Notification() 时转系统通知
- *   L2 浮动提示捕获（fixed/absolute/sticky）—— 抓取 toast 与页面自带横幅
- *   L3 聊天气泡捕获 —— 新增：抓取消息列表里新出现的「左侧/对方」气泡
+ * 只保留三件事，删掉了上一版的 DOM 抓取兜底：
  *
- * 关键背景（上一版为什么漏掉消息）：
- *   聊天气泡在文档流里是 position: static，不属于 L2 的浮动元素；
- *   页面自带的顶部消息条常用 sticky，也被上一版过滤器排除。
+ *   1. Notification 垫片
+ *      站点自己就会在收到新消息时调用 new Notification(title, {body, icon, tag})，
+ *      它内部已经有「是不是对方消息 / 通知开关是否打开」的过滤逻辑。
+ *      上一版额外加的 DOM toast 抓取，把站点所有 sonner 操作提示
+ *      （字卡已添加、头像已更新、聊天设置…）也全变成了系统通知 → 刷屏。
+ *      因此这里只接住站点主动发出的 Notification，不再猜 DOM。
+ *
+ *   2. Blob 导出截获
+ *      站点导出备份的做法是 a.href=URL.createObjectURL(blob); a.download=x.json; a.click()
+ *      WebView 的 DownloadListener 收到的是 blob: URL，系统下载器无法解析 → 导出静默失败。
+ *      这里在 JS 侧把 Blob 读成 data URL 交给 Native 落盘。
+ *
+ *   3. 麦克风/摄像头权限探测兜底
+ *      WebView 未实现 Permissions API，站点若用 navigator.permissions.query 预判
+ *      麦克风状态会拿不到结果，这里补一个返回 granted 的实现。
+ *
+ * 注入点：assets/notify_bridge.js（document-start），幂等。
  */
 (function () {
   'use strict';
@@ -18,144 +29,46 @@
   var DEBUG = false;
   window.__yannDebug = [];
 
-  /* ---------- 发往 Native ---------- */
-  function post(title, body, tag) {
-    body = String(body || '').trim();
+  function native() {
+    return (window.AndroidNotify && typeof window.AndroidNotify.postMessage === 'function')
+      ? window.AndroidNotify : null;
+  }
+
+  function post(title, body, icon, tag) {
     title = String(title || '').trim();
-    if (!body && !title) return false;
+    body = String(body || '').trim();
+    if (!title && !body) return false;
+    var n = native();
+    if (!n) return false;
     try {
-      if (window.AndroidNotify && typeof window.AndroidNotify.postMessage === 'function') {
-        window.AndroidNotify.postMessage(JSON.stringify({
-          title: title || 'yann',
-          body: body,
-          tag: String(tag || '')
-        }));
-        if (DEBUG) window.__yannDebug.push({ t: Date.now(), title: title, body: body, tag: tag });
-        return true;
-      }
+      n.postMessage(JSON.stringify({
+        title: title || 'yann',
+        body: body,
+        icon: String(icon || ''),
+        tag: String(tag || '')
+      }));
+      if (DEBUG) window.__yannDebug.push({ t: Date.now(), title: title, body: body });
+      return true;
     } catch (e) {
       if (DEBUG) window.__yannDebug.push({ error: String(e) });
-    }
-    return false;
-  }
-
-  /* ---------- 去重 ---------- */
-  var recent = {};
-  var DEDUP_MS = 6000;
-
-  function duplicated(text) {
-    var key = text.replace(/\s+/g, '').slice(0, 100);
-    if (!key) return true;
-    var now = Date.now();
-    if (recent[key] && now - recent[key] < DEDUP_MS) return true;
-    recent[key] = now;
-    if (Object.keys(recent).length > 200) {
-      // 清掉过期项，避免内存增长
-      var fresh = {};
-      Object.keys(recent).forEach(function (k) {
-        if (now - recent[k] < DEDUP_MS) fresh[k] = recent[k];
-      });
-      recent = fresh;
-    }
-    return false;
-  }
-
-  function cleanText(el, max) {
-    var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-    max = max || 400;
-    if (!t || t.length > max) return '';
-    return t;
-  }
-
-  // 过滤掉不像消息的内容：时间戳、状态提示等
-  var NOISE_RE = /^(\d{1,2}:\d{2}(:\d{2})?|通话时长.*|对方正在输入.*|已读|未读|发送失败|重新发送|撤回了一条消息|加载更多|\+|-|×|⋯|\.{2,}|…)$/i;
-
-  function isNoise(t) {
-    if (!t) return true;
-    if (NOISE_RE.test(t)) return true;
-    if (t.length === 1 && !/[\u4e00-\u9fa5a-zA-Z0-9]/.test(t)) return true;
-    return false;
-  }
-
-  /* ---------- 会话名称（作为通知标题） ---------- */
-  var NAME_HINT = /(title|header|name|nick|contact|peer)/i;
-  var cachedName = '';
-  var nameAt = 0;
-
-  function conversationName() {
-    var now = Date.now();
-    if (cachedName && now - nameAt < 15000) return cachedName;
-    var found = '';
-    try {
-      var cands = document.querySelectorAll('[class],[id]');
-      for (var i = 0; i < cands.length && i < 3000; i++) {
-        var el = cands[i];
-        var hint = (el.className && String(el.className)) + ' ' + (el.id || '');
-        if (!NAME_HINT.test(hint)) continue;
-        var cs = window.getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-        var t = cleanText(el, 30);
-        if (!t || isNoise(t) || /\s/.test(t)) continue;   // 名字一般不含空格
-        var r = el.getBoundingClientRect();
-        if (r.top > 200 || r.width <= 0) continue;        // 只看顶部区域
-        found = t;
-        break;
-      }
-    } catch (e) { /* ignore */ }
-    if (!found) {
-      try {
-        var dt = (document.title || '').trim();
-        if (dt && dt.length <= 30 && !/yann/i.test(dt)) found = dt;
-      } catch (e) { /* ignore */ }
-    }
-    cachedName = found;
-    nameAt = now;
-    return found;
-  }
-
-  /* ---------- 左右对齐判定（区分对方/自己） ---------- */
-  var SELF_RE = /(self|mine|-me|own|right|out-?going|out_msg|sent|sender-me|by-me)/i;
-  var OTHER_RE = /(other|friend|recv|receive|in-?coming|left|peer|bot|ai|assistant)/i;
-
-  function alignOf(el) {
-    try {
-      var r = el.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return 'none';
-      var w = window.innerWidth || document.documentElement.clientWidth || 1;
-      var center = (r.left + r.width / 2) / w;
-      var isNarrow = r.width <= w * 0.8;
-      if (!isNarrow) return 'full';
-      return center < 0.56 ? 'left' : 'right';
-    } catch (e) {
-      return 'none';
+      return false;
     }
   }
 
-  function classHint(el) {
-    var s = '';
-    try {
-      var n = el, depth = 0;
-      while (n && n.nodeType === 1 && depth < 4) {
-        s += ' ' + (n.className ? String(n.className) : '') + ' ' + (n.id || '');
-        n = n.parentElement;
-        depth++;
-      }
-    } catch (e) { /* ignore */ }
-    return s;
-  }
+  /* ============ 1. Notification 垫片 ============ */
 
-  /* ================= L1：Notification 垫片 ================= */
   function YannNotification(title, options) {
     if (!(this instanceof YannNotification)) return new YannNotification(title, options);
     options = options || {};
     this.title = String(title || '');
     this.body = String(options.body || '');
     this.tag = options.tag || '';
+    this.icon = options.icon || '';
     this.onclick = null;
     this.onshow = null;
     this.onclose = null;
     this.onerror = null;
-    post(this.title || conversationName() || 'yann', this.body, this.tag || 'web');
+    post(this.title, this.body, this.icon, this.tag);
   }
   Object.defineProperty(YannNotification, 'permission', {
     value: 'granted', writable: false, configurable: false
@@ -171,134 +84,89 @@
   YannNotification.prototype.dispatchEvent = function () {};
   try { window.Notification = YannNotification; } catch (e) {}
 
-  /* ================= L2：浮动提示 / 页面自带横幅 ================= */
-  var HINT_RE = /(toast|notification|notice|banner|snack|alert|popup|push|inbox|preview|remind|message|msg|tip)/i;
+  // 站点里形如 `'Notification' in window && Notification.permission === 'granted'`
+  // 的判断现在恒成立；ServiceWorker 分支在 WebView 中不存在，会自然走 new Notification()。
 
-  function floatingKind(el) {
+  /* ============ 2. Blob 导出截获 ============ */
+
+  var urlToBlob = {};
+  try {
+    var origCreate = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = function (obj) {
+      var u = origCreate(obj);
+      try {
+        if (obj && typeof Blob !== 'undefined' && obj instanceof Blob) urlToBlob[u] = obj;
+      } catch (e) {}
+      return u;
+    };
+    var origRevoke = URL.revokeObjectURL.bind(URL);
+    URL.revokeObjectURL = function (u) {
+      // 站点 click() 后立刻 revoke；先保留 Blob 引用一会儿，
+      // Blob 对象本身不受 revoke 影响，仍可读取
+      setTimeout(function () { delete urlToBlob[u]; }, 5000);
+      return origRevoke(u);
+    };
+  } catch (e) {}
+
+  function saveBlobAs(href, filename, mime) {
+    var blob = urlToBlob[href];
+    if (!blob) return false;
+    var n = native();
+    if (!n || typeof n.saveFile !== 'function') return false;
     try {
-      var cs = window.getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden') return '';
-      if (parseFloat(cs.opacity) < 0.05) return '';
-      var pos = cs.position;
-      if (pos === 'fixed' || pos === 'absolute' || pos === 'sticky') return pos;
-      return '';
-    } catch (e) { return ''; }
-  }
-
-  function fromFloating(node) {
-    var el = node;
-    var pos = floatingKind(el);
-    if (!pos) {
-      var inner = null;
-      try { inner = el.querySelector('[role="alert"],[role="status"],[aria-live],[class]'); } catch (e) {}
-      if (inner) {
-        pos = floatingKind(inner);
-        if (!pos) return null;
-        el = inner;
-      } else return null;
-    }
-    var text = cleanText(el, 300);
-    if (isNoise(text)) return null;
-    return text;
-  }
-
-  /* ================= L3：聊天气泡 ================= */
-  function fromBubble(node) {
-    if (node.nodeType !== 1) return null;
-    var el = node;
-    // 若新增的是外层容器，往里找真正的消息行
-    var text = cleanText(el, 400);
-    if (isNoise(text)) {
-      var kids = el.children;
-      if (kids && kids.length) {
-        // 只处理「新行只有一个」的情况，避免整列表重建时刷屏
-        if (kids.length !== 1) return null;
-        el = kids[0];
-        text = cleanText(el, 400);
-        if (isNoise(text)) return null;
-      } else return null;
-    }
-
-    var hint = classHint(el);
-    if (SELF_RE.test(hint)) return null;          // 自己发的不通知
-
-    var a = alignOf(el);
-    var looksIncoming = (a === 'left') || OTHER_RE.test(hint);
-    if (!looksIncoming) return null;               // 右侧/自己 → 跳过
-
-    // 整行文本里可能混着头像字母/时间，尽力切出正文
-    var body = text;
-    try {
-      var bubble = el.querySelector('[class*="bubble"],[class*="content"],[class*="text"],[class*="msg"]');
-      var bt = bubble ? cleanText(bubble, 400) : '';
-      if (bt && bt.length <= text.length && text.indexOf(bt) >= 0) body = bt;
-    } catch (e) {}
-    if (isNoise(body)) body = text;
-
-    return { body: body, name: conversationName() };
-  }
-
-  /* ================= 观察器 ================= */
-  var warmupUntil = Date.now() + 3000;   // 冷启动/刷新时历史消息不刷屏
-  var observer = new MutationObserver(function (muts) {
-    if (Date.now() < warmupUntil) {
-      // 预热期：只登记文本，不发通知
-      for (var i = 0; i < muts.length; i++) {
-        var added = muts[i].addedNodes;
-        for (var j = 0; j < added.length; j++) {
-          if (added[j].nodeType === 1) {
-            var t = cleanText(added[j], 400);
-            if (t) duplicated(t);
-          }
-        }
-      }
-      return;
-    }
-    for (var m = 0; m < muts.length; m++) {
-      var nodes = muts[m].addedNodes;
-      for (var k = 0; k < nodes.length; k++) {
-        var n = nodes[k];
-        if (n.nodeType !== 1) continue;
+      var reader = new FileReader();
+      reader.onload = function () {
         try {
-          // L3 优先：聊天气泡带发送者信息
-          var b = fromBubble(n);
-          if (b && !duplicated(b.body)) {
-            post(b.name || 'yann', b.body, 'bubble');
-            continue;
-          }
-          // L2：浮动提示
-          var f = fromFloating(n);
-          if (f && !duplicated(f)) {
-            post(conversationName() || 'yann', f, 'float');
-          }
-        } catch (e) { /* 单个节点异常不影响其他 */ }
-      }
+          n.saveFile(String(filename || 'yann_export'), String(mime || blob.type || ''), String(reader.result));
+        } catch (e) {}
+      };
+      reader.onerror = function () {};
+      reader.readAsDataURL(blob);   // -> data:<mime>;base64,...
+      return true;
+    } catch (e) {
+      return false;
     }
-  });
+  }
 
-  function seedSeen() {
-    // 把已有消息登记为「已见」，历史消息不会在预热期后被重复推送
+  document.addEventListener('click', function (ev) {
     try {
-      var all = document.querySelectorAll('[class*="bubble"],[class*="msg"],[class*="message"],li,p');
-      for (var i = 0; i < all.length && i < 800; i++) {
-        var t = cleanText(all[i], 400);
-        if (t) duplicated(t);
+      var a = ev.target && ev.target.closest ? ev.target.closest('a[download]') : null;
+      if (!a) return;
+      var href = a.getAttribute('href') || a.href || '';
+      if (href.indexOf('blob:') !== 0) return;
+      var name = a.getAttribute('download') || '';
+      if (saveBlobAs(href, name, '')) {
+        ev.preventDefault();
+        ev.stopPropagation();
       }
     } catch (e) {}
-  }
+  }, true);
 
-  function observeBody() {
-    if (document.body) {
-      seedSeen();
-      observer.observe(document.body, { childList: true, subtree: true });
-      // 页面内导航/重新加载后重新预热
-      window.addEventListener('load', function () {
-        warmupUntil = Date.now() + 2500;
-        seedSeen();
-      }, false);
-    } else {
-      setTimeout(observeBody, 120);
+  // 兜底：有些实现直接 window.open(blobUrl)
+  try {
+    var origOpen = window.open;
+    window.open = function (u, t, f) {
+      try {
+        if (typeof u === 'string' && u.indexOf('blob:') === 0) {
+          if (saveBlobAs(u, 'yann_export', '')) return null;
+        }
+      } catch (e) {}
+      return origOpen.call(window, u, t, f);
+    };
+  } catch (e) {}
+
+  /* ============ 3. Permissions API 兜底 ============ */
+
+  try {
+    if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
+      var perms = { query: function (d) {
+        var name = (d && d.name) || '';
+        var state = (name === 'microphone' || name === 'camera') ? 'granted' : 'prompt';
+        return Promise.resolve({ name: name, state: state, onchange: null });
+      }};
+      Object.defineProperty(navigator, 'permissions', {
+        value: perms, configurable: true, writable: false
+      });
     }
-  }
-  observeBody();
+  } catch (e) {}
 })();
